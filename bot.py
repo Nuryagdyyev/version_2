@@ -9,6 +9,7 @@ Render.com | Python 3.11
 - F.video handler dubl düzedildi
 - Token/API key diňe env-den
 - Redis URL env-den
+- _copy_template_title TÄZE şablon (30 paragraph) indekslerine görä täzelendi ✅
 """
 
 import asyncio, base64, copy, io, json, logging, os, re
@@ -37,10 +38,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 log = logging.getLogger(__name__)
 
 # ── SAZLAMALAR ──────────────────────────────────────────────
-# Render'de "Environment Variables" bölümünde HÖKMAN goý:
-#   BOT_TOKEN        = siziň bot tokeniniz
-#   DEEPSEEK_API_KEY = siziň DeepSeek açaryňyz
-#   REDIS_URL        = (islege bagly) redis://...
 BOT_TOKEN        = os.getenv("BOT_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 REDIS_URL        = os.getenv("REDIS_URL")
@@ -355,12 +352,9 @@ TEMPLATE_B64 = (
 )
 
 
-# ✅ DÜZEDIŞ #2: Şablon ÝÜKLENIŞI — iki çeşmeli:
-# 1-nji: Eger "template.docx" faýly bar bolsa — şondan oka (iň ygtybarly)
-# 2-nji: Ýogsa — base64-den dekompressiýa et
+# ✅ DÜZEDIŞ #2: Şablon ÝÜKLENIŞI — iki çeşmeli
 _TEMPLATE_BYTES_CACHE = None
 
-# Birinji: template.docx faýlyndan synanyş
 _TEMPLATE_FILE_PATHS = ["template.docx", "/app/template.docx", "./template.docx"]
 for _path in _TEMPLATE_FILE_PATHS:
     try:
@@ -376,17 +370,14 @@ for _path in _TEMPLATE_FILE_PATHS:
     except Exception as e:
         log.warning(f"⚠️ {_path} okalmady: {e}")
 
-# Ikinji: Base64-den synanyş (faýl tapylmasa)
 if _TEMPLATE_BYTES_CACHE is None:
     try:
-        # Başga-başga ýerlerde WHITE-SPACE bozulýan bolsa - arassala
         _clean_b64 = "".join(TEMPLATE_B64.split())
         _TEMPLATE_BYTES_CACHE = base64.b64decode(_clean_b64)
         if _TEMPLATE_BYTES_CACHE[:4] != b'PK\x03\x04':
             log.error(f"❌ TEMPLATE_B64 ZIP faýly däl! Başlangyç baýtlar: {_TEMPLATE_BYTES_CACHE[:10]}")
             _TEMPLATE_BYTES_CACHE = None
         else:
-            # Hakykatdanam açylyp bilýärmi barla
             try:
                 import zipfile
                 with zipfile.ZipFile(io.BytesIO(_TEMPLATE_BYTES_CACHE)) as _zf:
@@ -413,7 +404,6 @@ def _get_template_bytes() -> bytes:
             "Şablon ýüklenmedi! template.docx faýly ýok ýa-da TEMPLATE_B64 bozuk. "
             "Çözgüt: template.docx faýlyny repositoryň köküne goşuň."
         )
-    # Her çagyryşda täze kopiýa gaýtarýarys — io.BytesIO sebäpli bozulmasyn
     return bytes(_TEMPLATE_BYTES_CACHE)
 
 
@@ -604,11 +594,10 @@ STAGES = [
 
 async def call_deepseek(d: dict, on_progress) -> str:
     prompt  = build_zadaniye_prompt(d) if d.get("service") == "zadaniye" else build_prompt(d)
-    # ✅ DÜZEDIŞ #1: Accept-Encoding: identity → "invalid distance too far back" ýalňyşlygyny aýyrýar
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type":  "application/json",
-        "Accept-Encoding": "identity",   # gzip/br gysyşy öçür — bozulan paketler sebäpli ýalňyşlyk çykmaz
+        "Accept-Encoding": "identity",
         "Accept": "application/json",
     }
     req_items = d.get("req_items", [])
@@ -838,6 +827,18 @@ def _set_p_text(new_p, text: str):
             else:
                 t_el.text = ""
 
+# ═══════════════════════════════════════════════════════════════════════
+# ✅ TÄZE ŞABLONA GÖRÄ DÜZEDILEN _copy_template_title (30 paragraph)
+# ═══════════════════════════════════════════════════════════════════════
+# Şablon strukturasy (indeks 0..29):
+#   [3]   «УНИВЕРСИТЕТ»                       → uniwersitet ady
+#   [4]   'высшего профессионального...'      → boş edilýär
+#   [8]   'РЕФЕРАТ по дисциплине...'          → görnüş + sapak + tema
+#   [14]  'Студент 1 курса, группы X'         → kurs/grupp
+#   [15]  'Ady Familiýa'                      → FIO
+#   [18]  'Проверил:'                         → mugallym bar bolsa
+#   [19]  'Mugallymyň ady'                    → mugallym ady
+#   [29]  '2026г.'                            → ýyl (soňky)
 def _copy_template_title(doc: Document, d: dict):
     svc_ru      = SVC_RU.get(d["service"], "Реферат")
     teacher     = d.get("teacher", "").strip()
@@ -845,16 +846,28 @@ def _copy_template_title(doc: Document, d: dict):
     has_teacher = bool(teacher and teacher != "______________")
     subject     = d.get("subject", "").strip()
     university  = d.get("university", "").strip()
+
     try:
         tmpl_bytes = _get_template_bytes()
         tmpl = Document(io.BytesIO(tmpl_bytes))
     except Exception as e:
         log.error(f"❌ Şablon açylmady: {e}")
         raise RuntimeError(f"Şablon açylmady: {e}")
+
+    total = len(tmpl.paragraphs)
+    log.info(f"Şablonda {total} paragraph bar")
+
     body   = doc.element.body
     sectPr = body.find(qn("w:sectPr"))
-    skip_teacher = set(range(25, 34)) if not has_teacher else set()
-    skip = skip_teacher | {37, 38, 39}
+
+    # Mugallym ýok bolsa — "Проверил:" (18) we mugallym ady (19) goýulmaýar
+    skip = set()
+    if not has_teacher:
+        skip.update({18, 19})
+
+    # Soňky paragraph (ýyl) — aýratyn ýerleşdireris, loop-da geçmesin
+    year_idx = total - 1  # 29
+    skip.add(year_idx)
 
     def _append(p_el):
         if sectPr is not None:
@@ -866,35 +879,43 @@ def _copy_template_title(doc: Document, d: dict):
         if i in skip:
             continue
         new_p = copy.deepcopy(tp._element)
+
         if i == 3:
+            # «УНИВЕРСИТЕТ» → hakyky uniwersitet ady
             _set_p_text(new_p, f"«{university}»")
         elif i == 4:
+            # 'высшего профессионального образования' → boş
             _set_p_text(new_p, "")
-        elif i == 9:
+        elif i == 8:
+            # РЕФЕРАТ по дисциплине / на тему: «Тема работы»
             if subject:
                 new_text = (f"{svc_ru} по дисциплине {subject}\n"
                             f"на тему: «{d['theme']}»")
             else:
                 new_text = f"{svc_ru} на тему: «{d['theme']}»"
             _set_p_text(new_p, new_text)
-        elif i == 17:
+        elif i == 14:
+            # Студент 1 курса, группы X → täze kurs/grupp
             _set_p_text(new_p, f"Студент {d['course']} курса, группы {d['group']}")
-        elif i == 18:
+        elif i == 15:
+            # Ady Familiýa → hakyky FIO
             _set_p_text(new_p, d["fullname"])
-        elif i == 25 and has_teacher:
+        elif i == 18 and has_teacher:
+            # Проверил: → wezipe bar bolsa goşulýar
             проверил = f"Проверил: {t_position}" if t_position else "Проверил:"
             _set_p_text(new_p, проверил)
-        elif i == 26 and has_teacher:
+        elif i == 19 and has_teacher:
+            # Mugallymyň ady → hakyky ady
             _set_p_text(new_p, teacher)
-            _append(new_p)
-            p19 = copy.deepcopy(tmpl.paragraphs[19]._element)
-            _append(p19)
-            continue
+
         _append(new_p)
 
-    p39 = copy.deepcopy(tmpl.paragraphs[39]._element)
-    _set_p_text(p39, "2026г.")
-    _append(p39)
+    # Soňky: ýyl paragraphy
+    if 0 <= year_idx < total:
+        p_year = copy.deepcopy(tmpl.paragraphs[year_idx]._element)
+        _set_p_text(p_year, "2026г.")
+        _append(p_year)
+
 
 def _auto_toc(doc, line_v: int):
     _para(doc, "Содержание", bold=True, center=True, size_pt=14,
@@ -1298,7 +1319,7 @@ async def h01(cb: CallbackQuery, state: FSMContext):
         await ask(cb,
             f"✅ <b>{SVC_TM[svc]}</b> saýlandy!\n\n"
             "📌 <b>2/13:</b> Ýörite talaplar barmy?\n\n"
-            "• <b>Talaplы</b> — öz talaplarыňyzy, faýl ýa-da surat ugradyp bilersiňiz\n"
+            "• <b>Talaplы</b> — öz talaplarыңyzy, faýl ýa-da surat ugradyp bilersiňiz\n"
             "• <b>Talapsyz</b> — adaty GOST görnüşi", KB_REQ)
         await state.set_state(St.s02)
     await cb.answer()
@@ -1605,11 +1626,9 @@ async def h13_generate(cb: CallbackQuery, state: FSMContext):
     await _run_generate(cb, state, d)
 
 
-# ✅ DÜZEDIŞ #3: F.video handler — admin üçin hem, ulanyjy üçin hem ikisini birleşdirdim
 @router.message(F.video | F.video_note)
 async def h_video(msg: Message):
     uid = msg.from_user.id
-    # Admin bolsa — file_id ber
     if uid in ADMIN_IDS:
         fid = msg.video.file_id if msg.video else msg.video_note.file_id
         await msg.answer(
@@ -1617,7 +1636,6 @@ async def h_video(msg: Message):
             f"Şony <code>INTRO_VIDEO_URL</code>-e ýaz.",
             parse_mode="HTML")
         return
-    # Adaty ulanyjy we töleg garaşýar
     if uid not in PAYMENT_PENDING:
         return
     await msg.answer(
@@ -1761,7 +1779,6 @@ async def main():
     me  = await bot.get_me()
     log.info(f"✅ @{me.username} işe başlady!")
 
-    # ✅ DÜZEDIŞ #5: Redis URL env-den, hardcode aýryldy
     storage = None
     if REDIS_URL and _HAS_REDIS:
         try:
